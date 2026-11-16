@@ -387,17 +387,19 @@ int main(int argc, char **argv) {
     }
   }
 
-  std::clock_t t_previous = std::clock();
-  double lag = 0.0;
+  // one game step every 10 ms (30 ms on Windows), as the original
+  // clock() ticks gave, kept by the wall clock so the game can sleep
+  // between steps instead of spinning:
+  using Clock = std::chrono::steady_clock;
 #ifdef _WIN32
-  const int DELTA_PER_UPDATE = 30;
+  const Clock::duration DELTA_PER_UPDATE = std::chrono::milliseconds(30);
 #else
-  const int DELTA_PER_UPDATE = 10000;
+  const Clock::duration DELTA_PER_UPDATE = std::chrono::milliseconds(10);
 #endif
 
   bool game_over = false;
   int enemy_count = 0;
-  srand(t_previous);
+  srand(std::clock() ^ std::time(nullptr));
   HideCursor();
 
   // this is our level loop. Every time the user reaches over 50%
@@ -416,18 +418,15 @@ int main(int argc, char **argv) {
     Hero hero;
     hero.Init(screen_size);
 
+    Clock::time_point next_update = Clock::now();
     while (true) {
-      std::clock_t t_current = std::clock();
-      std::clock_t elapsed = t_current - t_previous;
-      t_previous = t_current;
-      lag += elapsed;
-
       ProcessInput(hero);
-      while (lag >= DELTA_PER_UPDATE) {
+      while (Clock::now() >= next_update) {
         Update(enemies, hero, score);
-        lag -= DELTA_PER_UPDATE;
+        next_update += DELTA_PER_UPDATE;
       }
       Render(enemies, hero, score, screen_size);
+      std::cout << std::flush;
 
       if (hero.is_dead()) {
         game_over = true;
@@ -438,6 +437,7 @@ int main(int argc, char **argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         break;
       }
+      std::this_thread::sleep_until(next_update);
     }
   }
   if (stealth) {
