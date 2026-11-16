@@ -17,6 +17,8 @@
  */
 #include <chrono>
 #include <csignal>
+#include <cstdarg>
+#include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
@@ -26,9 +28,11 @@
 
 #ifdef _WIN32
 #include <conio.h>
+#include <direct.h>
 #include <windows.h>
 #else
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <sys/select.h>
 #include <termios.h>
 #include <unistd.h>
@@ -206,17 +210,92 @@ void Render(EnemyList &enemies, Hero hero, int score, int screen_size) {
   std::cout << line << "    \r";
 }
 
+// Session log: with XONITIX_LOG set (to anything), every key, each
+// level and a snapshot once a second go to xonitix.log in the state
+// folder ($XDG_STATE_HOME/xonitix, else ~/.local/state/xonitix;
+// %LOCALAPPDATA%\xonitix on Windows). Nothing is written without it.
+FILE *session_log = nullptr;
+const auto log_start = std::chrono::steady_clock::now();
+
+void Log(const char *format, ...) {
+  if (session_log == nullptr) {
+    return;
+  }
+  long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                     std::chrono::steady_clock::now() - log_start)
+                     .count();
+  fprintf(session_log, "%6lld.%03lld ", ms / 1000, ms % 1000);
+  va_list args;
+  va_start(args, format);
+  vfprintf(session_log, format, args);
+  va_end(args);
+  fputc('\n', session_log);
+  fflush(session_log);
+}
+
+void OpenLog() {
+  const char *wanted = getenv("XONITIX_LOG");
+  if (wanted == nullptr || *wanted == '\0') {
+    return;
+  }
+  std::string dir;
 #ifdef _WIN32
+  const char *base = getenv("LOCALAPPDATA");
+  if (base == nullptr || *base == '\0') {
+    return;
+  }
+  dir = std::string(base) + "\\xonitix";
+  _mkdir(dir.c_str());
+  std::string path = dir + "\\xonitix.log";
+#else
+  const char *state = getenv("XDG_STATE_HOME");
+  const char *home = getenv("HOME");
+  if (state != nullptr && *state != '\0') {
+    dir = std::string(state) + "/xonitix";
+  } else if (home != nullptr && *home != '\0') {
+    dir = std::string(home) + "/.local/state/xonitix";
+  } else {
+    return;
+  }
+  for (size_t i = 1; i <= dir.size(); i++) {  // mkdir -p
+    if (i == dir.size() || dir[i] == '/') {
+      mkdir(dir.substr(0, i).c_str(), 0755);
+    }
+  }
+  std::string path = dir + "/xonitix.log";
+#endif
+  session_log = fopen(path.c_str(), "a");
+}
+
+void LogSnapshot(EnemyList &enemies, Hero hero, int score) {
+  std::string dots;
+  for (auto &enemy : enemies) {
+    dots += " " + std::to_string(enemy.x());
+  }
+  Log("level %d score %d hero %d filled %d dots%s",
+      static_cast<int>(enemies.size()), score, hero.x(),
+      static_cast<int>(hero.walls().size()), dots.c_str());
+}
+
+#ifdef _WIN32
+bool KeyDown(int key) {
+  if (GetAsyncKeyState(key)) {
+    Log("key %d", key);
+    return true;
+  }
+  return false;
+}
+
 void ProcessInput(Hero &hero) {
-  if (GetAsyncKeyState(VK_LEFT)) {
+  if (KeyDown(VK_LEFT)) {
     hero.SlideLeft();
-  } else if (GetAsyncKeyState(VK_RIGHT)) {
+  } else if (KeyDown(VK_RIGHT)) {
     hero.SlideRight();
-  } else if (GetAsyncKeyState(VK_DOWN)) {
+  } else if (KeyDown(VK_DOWN)) {
     hero.Stop();
-  } else if (GetAsyncKeyState(VK_SPACE)) {
+  } else if (KeyDown(VK_SPACE)) {
     hero.Fire();
-  } else if (GetAsyncKeyState(0x51)) {  // 'q'
+  } else if (KeyDown(0x51)) {  // 'q'
     hero.Die();
   }
 }
@@ -298,13 +377,19 @@ int DetectKeyPress() {
   return select(STDIN + 1, &rdset, nullptr, nullptr, &timeout);
 }
 
+int GetKey() {
+  int k = std::cin.get();
+  Log("key %d", k);
+  return k;
+}
+
 void ProcessInput(Hero &hero) {
   if (DetectKeyPress() != 0) {
-    int k = std::cin.get();
+    int k = GetKey();
     if (k == 27) {
-      k = std::cin.get();
+      k = GetKey();
       if (k == 91) {
-        k = std::cin.get();
+        k = GetKey();
         if (k == 67) {  // right key
           hero.SlideRight();
         } else if (k == 68) {  // left key
@@ -397,6 +482,9 @@ int main(int argc, char **argv) {
   const Clock::duration DELTA_PER_UPDATE = std::chrono::milliseconds(10);
 #endif
 
+  OpenLog();
+  Log("start: line of %d, xonitix %s", screen_size, VERSION.c_str());
+
   bool game_over = false;
   int enemy_count = 0;
   srand(std::clock() ^ std::time(nullptr));
@@ -417,6 +505,9 @@ int main(int argc, char **argv) {
 
     Hero hero;
     hero.Init(screen_size);
+    Log("level %d begins", enemy_count);
+    LogSnapshot(enemies, hero, score);
+    Clock::time_point next_snapshot = Clock::now() + std::chrono::seconds(1);
 
     Clock::time_point next_update = Clock::now();
     while (true) {
@@ -427,12 +518,20 @@ int main(int argc, char **argv) {
       }
       Render(enemies, hero, score, screen_size);
       std::cout << std::flush;
+      if (session_log != nullptr && Clock::now() >= next_snapshot) {
+        LogSnapshot(enemies, hero, score);
+        next_snapshot += std::chrono::seconds(1);
+      }
 
       if (hero.is_dead()) {
+        LogSnapshot(enemies, hero, score);
+        Log("game over at level %d, score %d", enemy_count, score);
         game_over = true;
         break;
       }
       if (hero.ShouldLevelUp()) {
+        LogSnapshot(enemies, hero, score);
+        Log("level %d cleared, score %d", enemy_count, score);
         fflush(stdout);  // let the player see victory before level up!
         std::this_thread::sleep_for(std::chrono::milliseconds(2000));
         break;
