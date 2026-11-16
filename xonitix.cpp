@@ -16,6 +16,7 @@
  *
  */
 #include <chrono>
+#include <csignal>
 #include <cstdlib>
 #include <ctime>
 #include <iostream>
@@ -220,14 +221,53 @@ void ProcessInput(Hero &hero) {
   }
 }
 
-void HideCursor() {
+void SetCursorVisible(BOOL visible) {
   HANDLE consoleHandle = GetStdHandle(STD_OUTPUT_HANDLE);
   CONSOLE_CURSOR_INFO info;
   info.dwSize = 100;
-  info.bVisible = FALSE;
+  info.bVisible = visible;
   SetConsoleCursorInfo(consoleHandle, &info);
 }
+
+// GetAsyncKeyState() leaves every key in the console's input buffer,
+// so they are dropped here instead of reaching the shell afterwards.
+void RestoreTerminal() {
+  SetCursorVisible(TRUE);
+  FlushConsoleInputBuffer(GetStdHandle(STD_INPUT_HANDLE));
+}
+
+void HideCursor() {
+  SetCursorVisible(FALSE);
+  atexit(RestoreTerminal);
+}
 #else
+termios original_term{};
+bool term_changed = false;
+
+// puts the terminal back as the game found it: line buffering,
+// echo and the cursor (only calls that are safe in a signal handler)
+void RestoreTerminalNow() {
+  if (term_changed) {
+    tcsetattr(0, TCSANOW, &original_term);
+    term_changed = false;
+  }
+  const char show_cursor[] = "\e[?25h";
+  if (write(STDOUT_FILENO, show_cursor, sizeof show_cursor - 1) < 0) {
+    return;
+  }
+}
+
+void RestoreTerminal() {
+  std::cout << std::flush;
+  RestoreTerminalNow();
+}
+
+void RestoreAndExit(int sig) {
+  RestoreTerminalNow();
+  signal(sig, SIG_DFL);
+  raise(sig);
+}
+
 // this function is heavily inspired Morgan McGuire's article:
 // http://www.flipcode.com/archives/_kbhit_for_Linux.shtml
 int DetectKeyPress() {
@@ -239,7 +279,9 @@ int DetectKeyPress() {
   if (!init) {
     termios term{};
     tcgetattr(STDIN, &term);
-    term.c_lflag &= ~ICANON;
+    original_term = term;
+    term_changed = true;
+    term.c_lflag &= ~(ICANON | ECHO);
     tcsetattr(STDIN, TCSANOW, &term);
     setbuf(stdin, nullptr);
     init = true;
@@ -279,7 +321,13 @@ void ProcessInput(Hero &hero) {
   }
 }
 
-void HideCursor() { std::cout << "\e[?25l"; }
+void HideCursor() {
+  atexit(RestoreTerminal);
+  signal(SIGINT, RestoreAndExit);
+  signal(SIGTERM, RestoreAndExit);
+  signal(SIGHUP, RestoreAndExit);
+  std::cout << "\e[?25l";
+}
 
 #endif
 
